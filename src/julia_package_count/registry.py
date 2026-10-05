@@ -3,12 +3,17 @@ from __future__ import annotations
 import csv
 import re
 import subprocess
+from bisect import bisect_left
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from itertools import accumulate
 from pathlib import Path
 from typing import Iterable
 
 REGISTRY_URL = "https://github.com/JuliaRegistries/General.git"
+ROLLING_WINDOW_DAYS = 365
 ROOT_LETTER_RE = re.compile(r"^[A-Z0-9]$")
+VERSION_HEADER_RE = re.compile(r'^\+\["[^"]+"\]\s*$')
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,13 @@ class Snapshot:
     jll: int
     ref: str
     note: str
+
+
+@dataclass(frozen=True)
+class RollingPackageCount:
+    month: str
+    released_last_12m: int
+    registered: int
 
 
 def classify_package_toml(path: str) -> str | None:
@@ -77,11 +89,26 @@ def ensure_registry(
     branch: str = "master",
     fetch: bool = True,
 ) -> str:
-    """Clone or update General and return the ref name to query."""
+    """Clone or update General and return the ref name to query.
+
+    The clone is not filtered: release detection reads Versions.toml patches, which a
+    blobless partial clone can only fetch blob by blob over the network.
+    """
     registry_dir = registry_dir.resolve()
     ref_name = f"origin/{branch}"
 
     if (registry_dir / ".git").exists():
+        partial = subprocess.run(
+            ["git", "config", "--get", "remote.origin.partialclonefilter"],
+            cwd=registry_dir,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if partial:
+            raise RuntimeError(
+                f"{registry_dir} is a partial clone ({partial}); delete it and re-run so a "
+                "full clone is made, otherwise reading Versions.toml patches is very slow."
+            )
         if fetch:
             subprocess.run(
                 ["git", "fetch", "--prune", "origin", branch],
@@ -95,7 +122,6 @@ def ensure_registry(
         [
             "git",
             "clone",
-            "--filter=blob:none",
             "--branch",
             branch,
             remote_url,
@@ -232,3 +258,134 @@ def write_growth_csv(growth: list[tuple[str, int]], path: Path) -> None:
         writer.writeheader()
         for label, value in growth:
             writer.writerow({"year": label, "non_jll_package_increase": value})
+
+
+def package_name_from_versions_toml(path: str) -> str | None:
+    """Registry package name for a Versions.toml path, or None for JLL/irrelevant paths."""
+    parts = path.strip().split("/")
+
+    if len(parts) == 3 and ROOT_LETTER_RE.fullmatch(parts[0]) and parts[2] == "Versions.toml":
+        return None if parts[1].endswith("_jll") else parts[1]
+
+    return None
+
+
+def release_events(repo_dir: Path, ref: str, since: str) -> dict[str, list[datetime]]:
+    """Non-JLL package name -> UTC dates of a version added to Versions.toml, oldest first.
+
+    Only added version entries count, so registry-wide commits that rewrite or prune
+    Versions.toml files (for example the 2019-10 Julia 1.0 cleanup) are not releases.
+    """
+    log = git_output(
+        repo_dir,
+        "log",
+        "-p",
+        "--unified=0",
+        "--format=%x00%cI",
+        f"--since={since}",
+        ref,
+        "--",
+        "*/Versions.toml",
+    )
+
+    events: dict[str, list[datetime]] = {}
+    for chunk in log.split("\0")[1:]:
+        lines = chunk.splitlines()
+        if not lines:
+            continue
+        committed_at = datetime.fromisoformat(lines[0].strip()).astimezone(timezone.utc)
+        released: set[str] = set()
+        path: str | None = None
+        for line in lines[1:]:
+            if line.startswith("+++ "):
+                path = line[4:].removeprefix("b/").strip()
+            elif path is not None and VERSION_HEADER_RE.match(line):
+                name = package_name_from_versions_toml(path)
+                if name is not None:
+                    released.add(name)
+        for name in released:
+            events.setdefault(name, []).append(committed_at)
+
+    for dates in events.values():
+        dates.sort()
+    return events
+
+
+def month_starts(start: datetime, end: datetime) -> list[datetime]:
+    month = start.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    months: list[datetime] = []
+    while month <= end:
+        months.append(month)
+        month = (month.replace(day=28) + timedelta(days=5)).replace(day=1)
+    return months
+
+
+def rolling_counts(
+    events: dict[str, list[datetime]],
+    months: list[datetime],
+) -> list[int]:
+    """Packages with any release in (month - ROLLING_WINDOW_DAYS, month], once per package.
+
+    A package with several releases inside the window must still count once, so its release
+    history is reduced to the intervals [release, min(next release, release + window)).
+    """
+    window = timedelta(days=ROLLING_WINDOW_DAYS)
+    delta = [0] * (len(months) + 1)
+
+    for releases in events.values():
+        for index, release in enumerate(releases):
+            end = release + window
+            if index + 1 < len(releases) and releases[index + 1] < end:
+                end = releases[index + 1]
+            start_month = bisect_left(months, release)
+            end_month = bisect_left(months, end)
+            if end_month > start_month:
+                delta[start_month] += 1
+                delta[end_month] -= 1
+
+    return list(accumulate(delta))[: len(months)]
+
+
+def head_commit_date(repo_dir: Path, ref: str) -> datetime:
+    return datetime.fromisoformat(
+        git_output(repo_dir, "log", "-1", "--format=%cI", ref).strip()
+    ).astimezone(timezone.utc)
+
+
+def monthly_rolling_counts(
+    repo_dir: Path,
+    ref_name: str,
+    end: datetime,
+) -> list[RollingPackageCount]:
+    """Monthly count of packages released in the trailing window, plus registry size.
+
+    The series starts at the first month start that has a full window inside the registry
+    history, so the window never reaches back before the registry exists.
+    """
+    history_start = datetime.fromisoformat(
+        first_non_empty_snapshot(repo_dir, ref_name).date
+    ).replace(tzinfo=timezone.utc)
+    full_window_start = history_start + timedelta(days=ROLLING_WINDOW_DAYS)
+    months = [month for month in month_starts(history_start, end) if month >= full_window_start]
+
+    events = release_events(repo_dir, ref_name, since=history_start.date().isoformat())
+    released = rolling_counts(events, months)
+
+    rows: list[RollingPackageCount] = []
+    for month, count in zip(months, released):
+        date = month.date().isoformat()
+        ref = snapshot_before(repo_dir, ref_name, f"{date}T00:00:00Z")
+        registered = count_ref(repo_dir, ref).non_jll if ref is not None else 0
+        rows.append(
+            RollingPackageCount(month=date, released_last_12m=count, registered=registered)
+        )
+    return rows
+
+
+def write_rolling_csv(rows: list[RollingPackageCount], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["month", "released_last_12m", "registered"])
+        for row in rows:
+            writer.writerow([row.month, row.released_last_12m, row.registered])

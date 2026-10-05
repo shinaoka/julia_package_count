@@ -4,13 +4,16 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from julia_package_count.chart import write_chart
+from julia_package_count.chart import write_chart, write_rolling_chart
 from julia_package_count.registry import (
     REGISTRY_URL,
     build_snapshots,
     ensure_registry,
     growth_by_year,
+    head_commit_date,
+    monthly_rolling_counts,
     write_growth_csv,
+    write_rolling_csv,
     write_snapshot_csv,
 )
 
@@ -88,7 +91,19 @@ def main(argv: list[str] | None = None) -> int:
     write_growth_csv(growth, growth_csv)
     chart_paths = write_chart(snapshots, growth, chart_stem)
 
-    for path in [snapshot_csv, growth_csv, *chart_paths]:
+    # The monthly series derives its own history boundary from the registry, so it does not
+    # depend on --start-year / --end-year / --no-initial.
+    rolling_rows = monthly_rolling_counts(
+        repo_dir=args.registry_dir,
+        ref_name=ref_name,
+        end=head_commit_date(args.registry_dir, ref_name),
+    )
+    rolling_csv = args.output_dir / "julia_general_nonjll_released_last_12m.csv"
+    rolling_stem = args.output_dir / "julia_general_nonjll_released_last_12m"
+    write_rolling_csv(rolling_rows, rolling_csv)
+    rolling_chart_paths = write_rolling_chart(rolling_rows, rolling_stem)
+
+    for path in [snapshot_csv, growth_csv, *chart_paths, rolling_csv, *rolling_chart_paths]:
         print(path)
     return 0
 
